@@ -124,6 +124,8 @@ class KeyframeBurnIn(io.ComfyNode):
                              tooltip="Pixel margin from image edges"),
                 io.Combo.Input("font_color", options=COLORS, default="white"),
                 io.Combo.Input("background", options=BACKGROUNDS, default="solid_black"),
+                io.Float.Input("overlay_opacity", default=0.5, min=0.0, max=1.0, step=0.05,
+                               tooltip="Opacity of keyframe overlay on top of the original frame"),
                 io.DynamicCombo.Input(
                     "keyframes",
                     options=options,
@@ -132,14 +134,16 @@ class KeyframeBurnIn(io.ComfyNode):
                 ),
             ],
             outputs=[
-                io.Image.Output(display_name="images", tooltip="Original sequence with frame numbers burned in (no keyframe replacement)"),
-                io.Image.Output(display_name="keyframes", tooltip="Sequence with keyframes swapped in at their frame positions and frame numbers burned in"),
+                io.Image.Output(display_name="images", tooltip="Original sequence with frame numbers burned in"),
+                io.Image.Output(display_name="keyframes", tooltip="Sequence with keyframes swapped in and frame numbers burned in"),
+                io.Image.Output(display_name="side_by_side", tooltip="Original and keyframe frames stitched side by side for comparison"),
+                io.Image.Output(display_name="overlay", tooltip="Keyframes blended over the original at the specified opacity"),
             ],
         )
 
     @classmethod
     def execute(cls, images, position, start_frame, padding_digits, font_size,
-                margin, font_color, background, keyframes) -> io.NodeOutput:
+                margin, font_color, background, overlay_opacity, keyframes) -> io.NodeOutput:
         fg_color = COLOR_MAP[font_color]
         bg_color = BG_MAP[background]
         batch_size = images.shape[0]
@@ -167,31 +171,51 @@ class KeyframeBurnIn(io.ComfyNode):
                         )
                     kf_batch[batch_idx] = kf_frame
 
-        # Burn frame numbers onto both batches
+        # Burn frame numbers and build all outputs
         images_out = []
         keyframes_out = []
+        side_by_side_out = []
+        overlay_out = []
+
         for i in range(batch_size):
             frame_num = start_frame + i
 
+            # Original with burn-in
             img_np = (images[i].cpu().numpy() * 255).astype(np.uint8)
             pil_img = Image.fromarray(img_np).convert("RGBA")
-            result = _burn_frame_number(
+            img_burned = _burn_frame_number(
                 pil_img, frame_num, padding_digits,
                 position, font_size, margin, fg_color, bg_color,
             )
-            images_out.append(torch.from_numpy(
-                np.array(result).astype(np.float32) / 255.0
-            ).unsqueeze(0))
+            img_t = torch.from_numpy(np.array(img_burned).astype(np.float32) / 255.0)
+            images_out.append(img_t.unsqueeze(0))
 
+            # Keyframes with burn-in
             kf_np = (kf_batch[i].cpu().numpy() * 255).astype(np.uint8)
             kf_pil = Image.fromarray(kf_np).convert("RGBA")
-            kf_result = _burn_frame_number(
+            kf_burned = _burn_frame_number(
                 kf_pil, frame_num, padding_digits,
                 position, font_size, margin, fg_color, bg_color,
             )
-            keyframes_out.append(torch.from_numpy(
-                np.array(kf_result).astype(np.float32) / 255.0
-            ).unsqueeze(0))
+            kf_t = torch.from_numpy(np.array(kf_burned).astype(np.float32) / 255.0)
+            keyframes_out.append(kf_t.unsqueeze(0))
 
-        return io.NodeOutput(torch.cat(images_out, dim=0), torch.cat(keyframes_out, dim=0))
+            # Side by side: [original | keyframes]
+            sbs = Image.new("RGB", (w * 2, h))
+            sbs.paste(img_burned, (0, 0))
+            sbs.paste(kf_burned, (w, 0))
+            sbs_t = torch.from_numpy(np.array(sbs).astype(np.float32) / 255.0)
+            side_by_side_out.append(sbs_t.unsqueeze(0))
+
+            # Overlay: keyframe blended over original
+            blend = Image.blend(img_burned, kf_burned, overlay_opacity)
+            blend_t = torch.from_numpy(np.array(blend).astype(np.float32) / 255.0)
+            overlay_out.append(blend_t.unsqueeze(0))
+
+        return io.NodeOutput(
+            torch.cat(images_out, dim=0),
+            torch.cat(keyframes_out, dim=0),
+            torch.cat(side_by_side_out, dim=0),
+            torch.cat(overlay_out, dim=0),
+        )
 
