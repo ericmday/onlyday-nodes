@@ -132,7 +132,8 @@ class KeyframeBurnIn(io.ComfyNode):
                 ),
             ],
             outputs=[
-                io.Image.Output(display_name="images", tooltip="Images with keyframes injected and frame numbers burned in"),
+                io.Image.Output(display_name="images", tooltip="Original sequence with frame numbers burned in (no keyframe replacement)"),
+                io.Image.Output(display_name="keyframes", tooltip="Sequence with keyframes swapped in at their frame positions and frame numbers burned in"),
             ],
         )
 
@@ -144,10 +145,9 @@ class KeyframeBurnIn(io.ComfyNode):
         batch_size = images.shape[0]
         h, w = images.shape[1], images.shape[2]
 
-        # Clone the batch so we can replace frames with keyframes
-        batch = images.clone()
+        # Build the keyframes batch (with replacements) separately from the original
+        kf_batch = images.clone()
 
-        # Inject keyframe images into the batch at their specified positions
         if keyframes:
             kf_keys = sorted([k for k in keyframes.keys() if k.startswith("keyframe_")])
             for kf_key in kf_keys:
@@ -155,11 +155,9 @@ class KeyframeBurnIn(io.ComfyNode):
                 img_tensor = keyframes[f"keyframe_{idx}"]
                 frame_idx = keyframes[f"frame_idx_{idx}"]
 
-                # frame_idx is the actual frame number; convert to batch index
                 batch_idx = frame_idx - start_frame
                 if 0 <= batch_idx < batch_size:
-                    # Resize keyframe to match batch dimensions if needed
-                    kf_frame = img_tensor[0]  # take first frame if batch
+                    kf_frame = img_tensor[0]
                     if kf_frame.shape[0] != h or kf_frame.shape[1] != w:
                         kf_pil = Image.fromarray(
                             (kf_frame.cpu().numpy() * 255).astype(np.uint8)
@@ -167,19 +165,33 @@ class KeyframeBurnIn(io.ComfyNode):
                         kf_frame = torch.from_numpy(
                             np.array(kf_pil).astype(np.float32) / 255.0
                         )
-                    batch[batch_idx] = kf_frame
+                    kf_batch[batch_idx] = kf_frame
 
-        # Burn frame numbers onto every frame in the batch
-        out = []
+        # Burn frame numbers onto both batches
+        images_out = []
+        keyframes_out = []
         for i in range(batch_size):
-            img_np = (batch[i].cpu().numpy() * 255).astype(np.uint8)
+            frame_num = start_frame + i
+
+            img_np = (images[i].cpu().numpy() * 255).astype(np.uint8)
             pil_img = Image.fromarray(img_np).convert("RGBA")
             result = _burn_frame_number(
-                pil_img, start_frame + i, padding_digits,
+                pil_img, frame_num, padding_digits,
                 position, font_size, margin, fg_color, bg_color,
             )
-            result_np = np.array(result).astype(np.float32) / 255.0
-            out.append(torch.from_numpy(result_np).unsqueeze(0))
+            images_out.append(torch.from_numpy(
+                np.array(result).astype(np.float32) / 255.0
+            ).unsqueeze(0))
 
-        return io.NodeOutput(torch.cat(out, dim=0))
+            kf_np = (kf_batch[i].cpu().numpy() * 255).astype(np.uint8)
+            kf_pil = Image.fromarray(kf_np).convert("RGBA")
+            kf_result = _burn_frame_number(
+                kf_pil, frame_num, padding_digits,
+                position, font_size, margin, fg_color, bg_color,
+            )
+            keyframes_out.append(torch.from_numpy(
+                np.array(kf_result).astype(np.float32) / 255.0
+            ).unsqueeze(0))
+
+        return io.NodeOutput(torch.cat(images_out, dim=0), torch.cat(keyframes_out, dim=0))
 
